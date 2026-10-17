@@ -1,4 +1,4 @@
-name: Build OnePlus Pad Pro OOS16 Kernel
+name: Build and Release OnePlus Kernels
 
 permissions:
   contents: write
@@ -8,50 +8,58 @@ on:
   workflow_dispatch:
     inputs:
       make_release:
-        description: '是否直接创建一个 GitHub Release 产物发布？'
+        description: 'Do you want to create a release?'
         required: true
         type: boolean
         default: false
       op_model:
-        description: '系统大版本选择（一加平板 Pro OOS16 专属固定为 A16）'
+        description: 'Select the OnePlus kernels to build'
         required: true
         type: choice
         options:
           - A16
+          - A14+15+16
+          - A15+16
+          - android16-6.1
+          - android14-6.1
         default: A16
       ksu_options:
-        description: 'BakaSU 强隐方案配置 JSON'
+        description: 'Enter KernelSU build json'
         required: true
         type: string
-        default: '[{"type":"bakasu","hash":"main"}]'
+        default: '[{"type":"ksun","hash":"dev"}]'
       optimize_level:
-        description: "编译器优化等级（一加魔改驱动务必首选 O2）"
+        description: "Compiler optimization level"
         required: true
         type: choice
         options: [O2, O3]
         default: O2
       clean_build:
-        description: '全新编译（不使用 ccache 缓存）'
+        description: 'Clean build (no ccache)'
         type: boolean
         default: false
       debug:
-        description: '启用 Debug 调试模式输出日志'
+        description: 'Enable debug mode: dumping debug related artifacts and show some debug logs'
         required: false
         type: boolean
         default: false
       mirror_toolchains:
-        description: '编译前是否同步工具链'
+        description: 'Do you want to sync toolchains before build? [99% runs not required]'
         required: false
         type: boolean
         default: false
       build_timestamp:
-        description: '自定义内核内核编译时间戳（uname -a）。留空则使用当前最新时间。'
+        description: 'Custom kernel build timestamp for uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty for current time.'
         type: string
         default: ''
       android14-6_1_susfs_branch_or_commit:
-        description: '6.1 内核专属 SUSFS 分支名称（请勿改动）'
+        description: 'Enter SusFS Branch or commit hash for android14-6.1 (OS16 Kernel 6.1.157)'
         type: string
-        default: 'gki-android14-6.1'
+        default: ''
+      android16-6_12_susfs_branch_or_commit:
+        description: 'Enter SusFS Branch or commit hash for android16-6.12'
+        type: string
+        default: ''
 
 jobs:
   set-op-model:
@@ -61,6 +69,7 @@ jobs:
       device_count: ${{ steps.set-matrix.outputs.count }}
       active_gki_keys: ${{ steps.set-matrix.outputs.active_gki_keys }}
       susfs_hash_android14_6_1:  ${{ steps.set-matrix.outputs.susfs_hash_android14_6_1 }}
+      susfs_hash_android16_6_12: ${{ steps.set-matrix.outputs.susfs_hash_android16_6_12 }}
       ksu_resolved_hash:    ${{ steps.set-matrix.outputs.ksu_resolved_hash }}
       ksu_options_normalized: ${{ steps.set-matrix.outputs.ksu_options_normalized }}
       susfs_base_version: ${{ steps.set-matrix.outputs.susfs_base_version }}
@@ -82,6 +91,7 @@ jobs:
           set -euo pipefail
           echo "::group::Matrix generation"
           
+          input="${{ github.event.inputs.op_model }}"
           ksu_options_raw='${{ github.event.inputs.ksu_options }}'
           if ! ksu_options_normalized=$(echo "$ksu_options_raw" | jq -c 'map(if .type then .type |= ascii_upcase | if .hash == null then if .type == "KSUN" then .hash = "dev" elif .type == "KSU" then .hash = "main" else .hash end else . end else error("No type found") end)' 2>&1); then
             echo "::error::ksu_options validation failed: $ksu_options_normalized"
@@ -103,14 +113,43 @@ jobs:
           done
           echo "]" >> matrix.json
           
-          # 强制锁定过滤：只寻找配置里属于一加平板Pro、且是 A16 / 6.1 内核的配置
-          jq_filter="map(select(.os_version == \"A16\" and .kernel_version == \"6.1\"))"
+          jq_filter="."
+          
+          case "$input" in
+            A14+15+16)
+              ;;
+            A15+16)
+              jq_filter="map(select(.os_version == \"A15\" or .os_version == \"A16\"))"
+              ;;
+            A16)
+              jq_filter="map(select(.os_version == \"A16\"))"
+              ;;
+            android16-6.1)
+              jq_filter="map(select(.os_version == \"A16\" and .kernel_version == \"6.1\"))"
+              echo "ℹ️  Android 16 Kernel 6.1 filter applied for OnePlus Pad Pro"
+              ;;
+            android*-*.*)
+              IFS='-' read -r av kv <<< "$input"
+              jq_filter="map(select(.os_version == \"A16\" or .os_version == \"A15\")) | map(select(.android_version == \"$av\" and .kernel_version == \"$kv\"))"
+              ;;
+            *)
+              echo "::warning::Unknown input '$input'. Using A16 default filter."
+              jq_filter="map(select(.os_version == \"A16\"))"
+              ;;
+          esac
           
           filtered=$(jq -c "$jq_filter" matrix.json)
           count=$(jq 'length' <<<"$filtered")
           
+          filtered=$(echo "$filtered" | jq '
+            sort_by(
+              (.os_version | gsub("A"; "") | tonumber) * -1,
+              .model
+            )
+          ')
+          
           if [ "$count" -eq 0 ]; then
-            echo "::error::未在 configs/ 目录中发现任何匹配 A16 且内核为 6.1 的一加平板 Pro 配置文件！"
+            echo "::error::No config files found for input '$input' after applying filters! Please ensure your OnePlus Pad Pro json exists in configs/"
             exit 1
           fi
           
@@ -126,16 +165,11 @@ jobs:
           final_count=$(echo "$merged_matrix" | jq 'length')
           
           echo "✅ Found $final_count device(s) to build"
-          echo "count=$count" >> "$GITHUB_OUTPUT"
           
           ksu_type=$(echo "$ksu_options_normalized" | jq -r '.[0].type')
           ksu_ref=$(echo "$ksu_options_normalized" | jq -r '.[0].hash')
           
-          # 动态匹配 BakaSU 仓库地址
-          if [ "$ksu_type" == "BAKASU" ]; then
-            KSU_REPO_OWNER="Baka-SU"
-            KSU_REPO_NAME="BakaSU"
-          elif [ "$ksu_type" == "KSUN" ]; then
+          if [ "$ksu_type" == "KSUN" ]; then
             KSU_REPO_OWNER="KernelSU-Next"
             KSU_REPO_NAME="KernelSU-Next"
           else
@@ -154,46 +188,90 @@ jobs:
             }
           }'
           
-          RESULT=$(gh api graphql -f query="$QUERY" -f owner="$KSU_REPO_OWNER" -f name="$KSU_REPO_NAME" -f headRef="$HEAD_REF" -f tagRef="$TAG_REF" -f objRef="$ksu_ref" 2>/dev/null || echo "")
-          resolved_sha=$(echo "$RESULT" | jq -r '.data.repository | (.hb.t.o // .ht.t.o // .ho.o // "unknown")' 2>/dev/null || echo "unknown")
+          RESULT=$(gh api graphql -f query="$QUERY" -f owner="$KSU_REPO_OWNER" -f name="$KSU_REPO_NAME" -f headRef="$HEAD_REF" -f tagRef="$TAG_REF" -f objRef="$ksu_ref" 2>/dev/null)
+          resolved_sha=$(echo "$RESULT" | jq -r '.data.repository | (.hb.t.o // .ht.t.o // .ho.o // "unknown")')
           
-          if [ "$resolved_sha" == "unknown" ] || [ -z "$resolved_sha" ]; then
-            # 容错：如果 GraphQL API 因私有或网络解析不到，回退使用主分支
-            resolved_sha="main"
+          if [ "$resolved_sha" == "unknown" ]; then
+            echo "::error::Ref/Hash '$ksu_ref' does not exist in $KSU_REPO_OWNER/$KSU_REPO_NAME"
+            exit 1
           fi
           
           echo "ksu_resolved_hash=$resolved_sha" >> "$GITHUB_OUTPUT"
-          merged_matrix=$(echo "$merged_matrix" | jq  --arg resolved_sha "$resolved_sha" 'map(.ksu_resolved_hash = $resolved_sha)')
+          merged_matrix=$(echo "$merged_matrix" | jq --arg resolved_sha "$resolved_sha" 'map(.ksu_resolved_hash = $resolved_sha)')
           
+          # SUSFS setup for 6.1 (OxygenOS 16 6.1.157 uses android14-6.1 or specific 6.1 branch)
           GITLAB_PROJECT_PATH="simonpunk/susfs4ksu"
-          user_val="${{ inputs.android14-6_1_susfs_branch_or_commit }}"
           
-          # 云端拉取 6.1 内核对应的 SUSFS 补丁 Hash
-          GL_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${user_val}\") { nodes { rawBlob } } } } }"
-          RESPONSE=$(curl -s --fail -G "https://gitlab.com" --data-urlencode "query=$GL_QUERY" || echo "")
-          resolved=$(echo "$RESPONSE" | jq -r '.data.project.repository.ch.sha // empty' 2>/dev/null || echo "")
+          declare -A default_branches=(
+            ["android14-6.1"]="gki-android14-6.1"
+            ["android16-6.12"]="gki-android16-6.12"
+          )
           
-          if [ -z "$resolved" ]; then
-            resolved="gki-android14-6.1"
+          declare -A user_inputs=(
+            ["android14-6.1"]="${{ inputs.android14-6_1_susfs_branch_or_commit }}"
+            ["android16-6.12"]="${{ inputs.android16-6_12_susfs_branch_or_commit }}"
+          )
+          
+          mapfile -t active_keys < <(
+            echo "$merged_matrix" \
+              | jq -r '.[] | select(.susfs == true) | "\(.android_version)-\(.kernel_version)"' \
+              | sort -u
+          )
+          
+          declare -A susfs_hashes
+          declare -A susfs_versions_per_key
+          
+          for key in "${active_keys[@]}"; do
+            default_val="${default_branches[$key]:-gki-android14-6.1}"
+            user_val="${user_inputs[$key]:-$default_val}"
+            
+            GL_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${user_val}\") { nodes { rawBlob } } } } }"
+            
+            RESPONSE=$(curl -s --fail -G "https://gitlab.com/api/graphql" --data-urlencode "query=$GL_QUERY")
+            resolved=$(echo "$RESPONSE" | jq -r '.data.project.repository.ch.sha // empty')
+            
+            if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
+              echo "::error::Could not resolve SUSFS ref '$user_val' for $key on GitLab."
+              exit 1
+            fi
+            
+            if [ "${{ inputs.make_release }}" = "true" ]; then
+              extracted=$(echo "$RESPONSE" | jq -r '.data.project.repository.blobs.nodes[0].rawBlob // empty' | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}')
+              susfs_versions_per_key[$key]="${extracted:-unknown}"
+            fi
+            
+            susfs_hashes["$key"]="$resolved"
+          done
+          
+          echo "active_gki_keys=$(IFS=','; echo "${active_keys[*]}")" >> "$GITHUB_OUTPUT"
+          echo "susfs_hash_android14_6_1=${susfs_hashes[android14-6.1]:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "susfs_hash_android16_6.12=${susfs_hashes[android16-6.12]:-unknown}" >> "$GITHUB_OUTPUT"
+          
+          if [ "${{ inputs.make_release }}" = "true" ]; then
+            susfs_base_version="v1.5.5" # 根据实际情况调整或动态获取
+            for key in "${active_keys[@]}"; do
+              ver="${susfs_versions_per_key[$key]:-unknown}"
+              if [ "$ver" != "unknown" ]; then
+                susfs_base_version="$ver"
+                break
+              fi
+            done
+            echo "susfs_base_version=$susfs_base_version" >> "$GITHUB_OUTPUT"
           fi
           
-          extracted=$(echo "$RESPONSE" | jq -r '.data.project.repository.blobs.nodes[0].rawBlob // empty' 2>/dev/null | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}' || echo "unknown")
-          echo "susfs_base_version=${extracted:-unknown}" >> "$GITHUB_OUTPUT"
+          susfs_hashes_json=$(jq -n \
+            --arg a14 "${susfs_hashes[android14-6.1]:-unknown}" \
+            --arg a16 "${susfs_hashes[android16-6.12]:-unknown}" \
+            '{"android14-6.1": $a14, "android16-6.12": $a16}')
           
-          echo "active_gki_keys=android14-6.1" >> "$GITHUB_OUTPUT"
-          echo "susfs_hash_android14_6_1=$resolved"   >> "$GITHUB_OUTPUT"
-          
-          susfs_hashes_json=$(jq -n --arg a14 "$resolved" '{"android14-6.1": $a14}')
           echo "$susfs_hashes_json" > susfs_lookup_temp.json
           merged_matrix=$(echo "$merged_matrix" | jq \
             --slurpfile hashes_array susfs_lookup_temp.json \
             '($hashes_array[0]) as $hashes | [.[] | . + {susfs_resolved_hash: ($hashes["\(.android_version)-\(.kernel_version)"] // "unknown")}]')
           
           rm susfs_lookup_temp.json
-          echo "$merged_matrix" > final_matrix_temp.json
-          wrapped=$(jq --slurp '{ include: .[] }' final_matrix_temp.json)
+          wrapped=$(jq --slurp '{ include: .[] }' <(echo "$merged_matrix"))
           echo "matrix=$(echo "$wrapped" | jq -c .)" >> "$GITHUB_OUTPUT"
-          rm final_matrix_temp.json
           echo "::endgroup::"
 
       - name: Upload build matrix
@@ -211,14 +289,14 @@ jobs:
     secrets: inherit
 
   prepare_ccache:
-    name: Prepare ccache binary (download once)
+    name: Prepare ccache binary
     runs-on: ubuntu-latest
     steps:
       - name: Download custom ccache once
         run: |
-          set -uo pipefail
-          url="https://githubusercontent.com"
-          curl -LfsS --connect-timeout 30 --max-time 120 -H "User-Agent: Mozilla/5.0" "$url" -o ccache && chmod +x ccache
+          url="https://raw.githubusercontent.com/WildKernels/kernel_patches/refs/heads/main/ccache/ccache-x86-64"
+          curl -LfsS "$url" -o ccache || true
+          chmod +x ccache || true
       - name: Upload ccache artifact
         uses: actions/upload-artifact@v7
         with:
@@ -227,7 +305,7 @@ jobs:
           retention-days: 1
 
   build:
-    name: build (${{ matrix.model }}, OOS16-6.1)
+    name: build (${{ matrix.model }}, Kernel 6.1.157, OS16)
     needs: [set-op-model, mirror_toolchain, prepare_ccache]
     runs-on: ubuntu-latest
     strategy:
@@ -239,11 +317,30 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 🧹 Emergency Disk Cleanup
-        if: ${{ matrix.disk_cleanup }}
-        uses: ./.github/actions/disk-cleanup
-
       - name: Install Minimal Dependencies
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix kmod libdw-dev elfutils pigz
+
+      - name: 🧹 Prepare op_config_json
+        id: prepare_config
+        shell: bash
+        run: |
+          echo "config_json=$(jq -nc --argjson m '${{ toJSON(matrix) }}' '$m | del(.ksu_type, .ksu_hash, .ksu_resolved_hash)')" >> "$GITHUB_OUTPUT"
+
+      - name: 🔨 Build Kernel (6.1.157 Optimization)
+        id: build
+        uses: ./.github/actions/build-kernel
+        with:
+          op_config_json: ${{ steps.prepare_config.outputs.config_json }}
+          ksu_type: ${{ matrix.ksu_type }}
+          ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
+          susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
+          optimize_level: ${{ inputs.optimize_level }}
+          build_timestamp: ${{ inputs.build_timestamp }}
+          clean: ${{ inputs.clean_build }}
+          debug: ${{ inputs.debug }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
